@@ -1,23 +1,25 @@
 import argparse
+import fnmatch
 import json
 import os
 import stat
 import sys
 import tarfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Optional, Tuple
+from typing import Optional, List, Tuple, Iterable, Dict
 
 import paramiko
 
 try:
-    import yaml  # pip install pyyaml (опционально)
+    import yaml  # опционально: pip install pyyaml
     HAVE_YAML = True
 except Exception:
     HAVE_YAML = False
 
 
-# ----------------------------- utils -----------------------------
+# ----------------------------- config -----------------------------
 
 def load_config(cfg_path: Path) -> dict:
     if not cfg_path.exists():
@@ -32,26 +34,27 @@ def load_config(cfg_path: Path) -> dict:
             return json.load(f) or {}
     return {}
 
+# ----------------------------- utils -----------------------------
+
 def normalize_arcpath(p: str) -> str:
-    # В ZIP могут встретиться обратные слэши; приводим к POSIX
     p = p.replace("\\", "/")
-    # Убираем лидирующие / и ./ чтобы не делать абсолютные пути на сервере
+    # убрать абсолют / и ./ спереди
     while p.startswith("/") or p.startswith("./"):
         p = p[1:] if p.startswith("/") else p[2:]
+    # убрать повторяющиеся слэши
+    while "//" in p:
+        p = p.replace("//", "/")
     return p
 
 def is_safe_join(root: PurePosixPath, rel: PurePosixPath) -> bool:
-    # Защита от path traversal: убедимся, что итоговый путь остаётся внутри root
     try:
         return str(root.joinpath(rel)).startswith(str(root))
     except Exception:
         return False
 
 def ensure_remote_dirs(sftp: paramiko.SFTPClient, path: str, verbose=False):
-    # Создаёт все директории по пути (как mkdir -p)
     parts = PurePosixPath(path).parts
     cur = PurePosixPath("/")
-    # Если путь относительный — стартуем от пустого (не корня)
     if not path.startswith("/"):
         cur = PurePosixPath(".")
     for part in parts:
@@ -62,20 +65,16 @@ def ensure_remote_dirs(sftp: paramiko.SFTPClient, path: str, verbose=False):
             if verbose:
                 print(f"[MKDIR] {sp}")
         except IOError:
-            # уже существует — ок
-            pass
+            pass  # уже есть
 
 def set_times_and_mode(sftp: paramiko.SFTPClient, rpath: str,
                        mtime: Optional[int], mode: Optional[int], verbose=False):
-    # mtime/atime
     try:
         if mtime is not None:
-            # atime == mtime, если отдельного нет
             sftp.utime(rpath, (mtime, mtime))
     except Exception:
         if verbose:
             print(f"[WARN] utime failed for {rpath}")
-    # права
     try:
         if mode is not None:
             sftp.chmod(rpath, mode & 0o7777)
@@ -83,77 +82,101 @@ def set_times_and_mode(sftp: paramiko.SFTPClient, rpath: str,
         if verbose:
             print(f"[WARN] chmod failed for {rpath}")
 
-def detect_zip_unix_mode(zi: zipfile.ZipInfo) -> Tuple[Optional[int], bool]:
-    """
-    Возвращает (mode, is_symlink) из внешних атрибутов ZipInfo (если были сохранены на Unix).
-    """
-    ext = zi.external_attr >> 16
-    mode = ext & 0o7777 if ext else None
-    # Тип файла в верхних битах:
-    is_symlink = (ext & 0o170000) == stat.S_IFLNK
-    return mode, is_symlink
-
-def first_top_level(zip_or_tar_iterable) -> Optional[str]:
-    """
-    Пытается определить единственный верхний каталог в архиве.
-    Возвращает его имя (без хвоста /), либо None.
-    """
+def first_top_level(names: Iterable[str]) -> Optional[str]:
     tops = set()
-    for name in zip_or_tar_iterable:
-        top = normalize_arcpath(name).split("/", 1)[0]
+    for n in names:
+        top = normalize_arcpath(n).split("/", 1)[0]
         if top:
             tops.add(top)
         if len(tops) > 1:
             return None
     return next(iter(tops)) if tops else None
 
+# ----------------------------- routing -----------------------------
+
+@dataclass
+class FileRoute:
+    src_prefix: str   # относительный префикс внутри архива
+    dst_root: str     # абсолютная папка на VM
+
+def build_routes(map_cfg: List[Dict]) -> List[FileRoute]:
+    routes = []
+    for item in map_cfg or []:
+        src = normalize_arcpath(str(item.get("from", "")).strip().strip("/"))
+        dst = str(item.get("to", "")).strip()
+        if not src or not dst:
+            continue
+        routes.append(FileRoute(src_prefix=src, dst_root=dst))
+    # длинные префиксы раньше, чтобы не перехватывали короткие
+    routes.sort(key=lambda r: len(r.src_prefix), reverse=True)
+    return routes
+
+def resolve_destination(rel_path: str, routes: List[FileRoute], default_root: str) -> Tuple[str, str]:
+    """
+    Возвращает (remote_dir, rel_inside_remote_dir) для файла rel_path.
+    Если попал под маршрут — remote_dir=route.dst_root, иначе remote_dir=default_root.
+    """
+    norm = normalize_arcpath(rel_path)
+    for r in routes:
+        if norm == r.src_prefix or norm.startswith(r.src_prefix + "/"):
+            tail = norm[len(r.src_prefix):].lstrip("/")
+            return r.dst_root, tail
+    return default_root, norm
 
 # ----------------------------- uploaders -----------------------------
 
-def upload_zip(sftp: paramiko.SFTPClient, zip_path: Path, remote_root: str,
-               strip_top_level: bool, verbose=False):
+def detect_zip_unix_mode(zi: zipfile.ZipInfo) -> Tuple[Optional[int], bool]:
+    ext = zi.external_attr >> 16
+    mode = ext & 0o7777 if ext else None
+    is_symlink = (ext & 0o170000) == stat.S_IFLNK
+    return mode, is_symlink
+
+def upload_zip(
+    sftp: paramiko.SFTPClient,
+    zip_path: Path,
+    base_remote_root: str,
+    routes: List[FileRoute],
+    strip_top_level: bool,
+    verbose: bool=False
+):
     with zipfile.ZipFile(zip_path, "r") as zf:
-        # Список имён для определения общего верхнего каталога
         top = first_top_level([i.filename for i in zf.infolist()])
         for zi in zf.infolist():
             name = normalize_arcpath(zi.filename)
-            if not name or name.endswith("/"):
-                # каталог (или пустая строка) — создадим директорию и дальше
-                if not name:
-                    continue
-                rel = name[:-1]
-                if strip_top_level and top and rel.startswith(top + "/"):
-                    rel = rel[len(top) + 1:]
-                rdir = str(PurePosixPath(remote_root) / rel) if rel else remote_root
-                ensure_remote_dirs(sftp, rdir, verbose=verbose)
-                # выставим права директории, если есть
-                mode, _ = detect_zip_unix_mode(zi)
-                set_times_and_mode(sftp, rdir, None, mode, verbose=verbose)
+            if not name:
                 continue
 
-            # файл или, возможно, symlink
-            rel = name
+            # каталоги в zip имеют хвост "/"
+            is_dir = name.endswith("/")
+            rel = name[:-1] if is_dir else name
+
             if strip_top_level and top and rel.startswith(top + "/"):
                 rel = rel[len(top) + 1:]
             if not rel:
                 continue
 
-            rpath = str(PurePosixPath(remote_root) / rel)
-            # защита от traversal
-            if not is_safe_join(PurePosixPath(remote_root), PurePosixPath(rel)):
+            remote_root, tail = resolve_destination(rel, routes, base_remote_root)
+            rpath = str(PurePosixPath(remote_root) / tail)
+
+            # защита
+            if not is_safe_join(PurePosixPath(remote_root), PurePosixPath(tail)):
                 if verbose:
                     print(f"[SKIP] unsafe path: {rel}")
                 continue
 
-            # Убедимся, что родительская директория есть
-            ensure_remote_dirs(sftp, str(PurePosixPath(rpath).parent), verbose=verbose)
+            if is_dir:
+                ensure_remote_dirs(sftp, rpath, verbose=verbose)
+                mode, _ = detect_zip_unix_mode(zi)
+                set_times_and_mode(sftp, rpath, None, mode, verbose=verbose)
+                continue
 
+            # файл / симлинк
+            ensure_remote_dirs(sftp, str(PurePosixPath(rpath).parent), verbose=verbose)
             mode, is_link = detect_zip_unix_mode(zi)
 
-            # Попытка обработать symlink (если архив создан на Unix и атрибуты сохранены)
             if is_link:
+                # содержимое zip-элемента — целевая строка ссылки
                 try:
-                    # В ZIP содержимое symlink — это целевая строка ссылки
                     link_target = zf.read(zi).decode("utf-8", "surrogateescape")
                     try:
                         sftp.remove(rpath)
@@ -162,13 +185,10 @@ def upload_zip(sftp: paramiko.SFTPClient, zip_path: Path, remote_root: str,
                     sftp.symlink(link_target, rpath)
                     if verbose:
                         print(f"[LINK] {rpath} -> {link_target}")
-                    # Права на симлинк обычно не применяются
-                    return
+                    continue
                 except Exception:
-                    # если не вышло — упадём обратно к записи файла
-                    pass
+                    pass  # упадём в запись как обычного файла
 
-            # Обычный файл: выгружаем потоково
             with zf.open(zi, "r") as src, sftp.open(rpath, "wb") as dst:
                 if verbose:
                     print(f"[PUT ] {rpath}")
@@ -178,30 +198,24 @@ def upload_zip(sftp: paramiko.SFTPClient, zip_path: Path, remote_root: str,
                         break
                     dst.write(chunk)
 
-            # Метаданные (mtime из date_time; права из external_attr)
-            # date_time -> (Y,M,D,H,M,S), переведём в epoch (без TZ)
+            # время из zip (без TZ)
             try:
+                import time as _time, datetime as _dt
                 dt_tuple = zi.date_time
-                # Примем локальное время как naive (zip не хранит TZ) — это нормально для большинства кейсов
-                import time as _time
-                import datetime as _dt
                 mtime = int(_time.mktime(_dt.datetime(*dt_tuple).timetuple()))
             except Exception:
                 mtime = None
             set_times_and_mode(sftp, rpath, mtime, mode, verbose=verbose)
 
-
-def upload_tar(sftp: paramiko.SFTPClient, tar_path: Path, remote_root: str,
-               strip_top_level: bool, verbose=False):
-    mode_map = {
-        tarfile.SYMTYPE: "symlink",
-        tarfile.DIRTYPE: "dir",
-        tarfile.AREGTYPE: "file",
-        tarfile.REGTYPE: "file",
-        tarfile.LNKTYPE: "hardlink",
-    }
+def upload_tar(
+    sftp: paramiko.SFTPClient,
+    tar_path: Path,
+    base_remote_root: str,
+    routes: List[FileRoute],
+    strip_top_level: bool,
+    verbose: bool=False
+):
     with tarfile.open(tar_path, "r:*") as tf:
-        # Определим общий топ
         top = first_top_level([m.name for m in tf.getmembers()])
         for m in tf:
             name = normalize_arcpath(m.name)
@@ -213,24 +227,23 @@ def upload_tar(sftp: paramiko.SFTPClient, tar_path: Path, remote_root: str,
             if not rel:
                 continue
 
-            rpath = str(PurePosixPath(remote_root) / rel)
-            if not is_safe_join(PurePosixPath(remote_root), PurePosixPath(rel)):
+            remote_root, tail = resolve_destination(rel, routes, base_remote_root)
+            rpath = str(PurePosixPath(remote_root) / tail)
+            if not is_safe_join(PurePosixPath(remote_root), PurePosixPath(tail)):
                 if verbose:
                     print(f"[SKIP] unsafe path: {rel}")
                 continue
 
-            kind = mode_map.get(m.type, "other")
-
-            if kind == "dir":
+            t = m.type
+            if t == tarfile.DIRTYPE:
                 ensure_remote_dirs(sftp, rpath, verbose=verbose)
                 set_times_and_mode(sftp, rpath, int(m.mtime) if m.mtime else None,
                                    m.mode if m.mode else None, verbose=verbose)
                 continue
 
-            # Ensure parent dir exists
             ensure_remote_dirs(sftp, str(PurePosixPath(rpath).parent), verbose=verbose)
 
-            if kind == "symlink" and m.linkname:
+            if t == tarfile.SYMTYPE and m.linkname:
                 try:
                     try:
                         sftp.remove(rpath)
@@ -239,21 +252,17 @@ def upload_tar(sftp: paramiko.SFTPClient, tar_path: Path, remote_root: str,
                     sftp.symlink(m.linkname, rpath)
                     if verbose:
                         print(f"[LINK] {rpath} -> {m.linkname}")
-                    # mtime для ссылок обычно не ставим
                     continue
                 except Exception:
-                    # fallback — запишем как обычный файл с содержимым ссылки (редко нужно)
                     pass
 
-            if kind == "file":
+            if t in (tarfile.AREGTYPE, tarfile.REGTYPE):
                 fsrc = tf.extractfile(m)
                 if fsrc is None:
-                    # пустой файл
-                    fsrc_data = b""
                     with sftp.open(rpath, "wb") as dst:
                         if verbose:
                             print(f"[PUT ] {rpath} (empty)")
-                        dst.write(fsrc_data)
+                        dst.write(b"")
                 else:
                     with fsrc, sftp.open(rpath, "wb") as dst:
                         if verbose:
@@ -267,15 +276,82 @@ def upload_tar(sftp: paramiko.SFTPClient, tar_path: Path, remote_root: str,
                                    m.mode if m.mode else None, verbose=verbose)
                 continue
 
-            # Остальные типы (hardlink и т.п.) — по ситуации пропустим
             if verbose:
-                print(f"[SKIP] unsupported member type {m.type} for {name}")
+                print(f"[SKIP] unsupported tar member type {t} for {name}")
 
+# ----------------------------- DB restore -----------------------------
+
+def shquote(x: str) -> str:
+    return x
+
+def run_sql_via_psql(
+    ssh: paramiko.SSHClient,
+    sql_stream,
+    db_cfg: dict,
+    verbose: bool=False
+):
+    """
+    Качает SQL в stdin psql на VM.
+    db_cfg: {psql_path, db_host, db_port, db_name, db_user, db_password, create_db_if_missing, drop_before}
+    """
+    psql_path = db_cfg.get("psql_path", "psql")
+    db_host = str(db_cfg.get("db_host", "127.0.0.1"))
+    db_port = int(db_cfg.get("db_port", 5432))
+    db_name = str(db_cfg.get("db_name"))
+    db_user = str(db_cfg.get("db_user"))
+    db_password = db_cfg.get("db_password")
+    create_db = bool(db_cfg.get("create_db_if_missing", False))
+    drop_before = bool(db_cfg.get("drop_before", False))
+
+    if not db_name or not db_user:
+        raise ValueError("Для восстановления БД нужны db_name и db_user")
+    
+    env_prefix = f"PGPASSWORD={shquote(db_password)} " if db_password else ""
+    full_cmd = shquote(env_prefix + f"dropdb -h {shquote(db_host)} -p {db_port} -U {shquote(db_user)} {shquote(db_name)}")
+    _, stdout_c, stderr_c = ssh.exec_command(full_cmd)
+    code = stdout_c.channel.recv_exit_status()
+    if code != 0:
+        err = stderr_c.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"Удаление БД завершилось с кодом {code}:\n{err}")
+    
+    full_cmd = shquote(env_prefix + f"createdb -h {shquote(db_host)} -p {db_port} -U {shquote(db_user)} {shquote(db_name)}")
+    _, stdout_c, stderr_c = ssh.exec_command(full_cmd)
+    code = stdout_c.channel.recv_exit_status()
+    if code != 0:
+        err = stderr_c.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"создание БД завершилось с кодом {code}:\n{err}")
+
+    # Основной импорт
+    base_cmd = (
+        f"{psql_path} -h {shquote(db_host)} -p {db_port} -U {shquote(db_user)} "
+        f"-d {shquote(db_name)} -v ON_ERROR_STOP=1"
+    )
+    
+    full_cmd = shquote(env_prefix + base_cmd)
+    if verbose:
+        print(f"[INFO] psql restore cmd: {full_cmd}")
+
+    stdin, stdout, stderr = ssh.exec_command(full_cmd)
+    try:
+        while True:
+            chunk = sql_stream.read(1024 * 1024)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", "ignore")
+            stdin.write(chunk)
+        stdin.channel.shutdown_write()
+    finally:
+        # дождёмся завершения
+        code = stdout.channel.recv_exit_status()
+        if code != 0:
+            err = stderr.read().decode("utf-8", "ignore")
+            raise RuntimeError(f"psql вернул код {code}:\n{err}")
 
 # ----------------------------- main -----------------------------
 
 def main():
-    # Грузим конфиг рядом (если есть)
+    # Конфиг рядом
     default_cfg = {}
     here = Path(__file__).resolve().parent
     for fname in ("config.yaml", "config.yml", "config.json"):
@@ -286,7 +362,7 @@ def main():
             break
 
     ap = argparse.ArgumentParser(
-        description="Заливает файлы из локального архива на Linux VM в указанную папку (по SFTP)."
+        description="Разворачивает файлы из архива на Linux VM (по \"нужным местам\") и восстанавливает БД PostgreSQL из .sql внутри архива."
     )
     ap.add_argument("--host", default=default_cfg.get("host"))
     ap.add_argument("--port", type=int, default=default_cfg.get("port", 22))
@@ -299,8 +375,7 @@ def main():
     ap.add_argument("--remote-dir", default=default_cfg.get("remote_dir"))
     ap.add_argument("--archive", default=default_cfg.get("archive"))
     ap.add_argument("--strip-top-level", action="store_true",
-                    default=bool(default_cfg.get("strip_top_level", False)),
-                    help="Если в архиве единственный верхний каталог — срезать его.")
+                    default=bool(default_cfg.get("strip_top_level", False)))
     ap.add_argument("--verbose", action="store_true", default=bool(default_cfg.get("verbose", False)))
 
     args = ap.parse_args()
@@ -315,7 +390,10 @@ def main():
         print(f"[ОШИБКА] Архив не найден: {archive}", file=sys.stderr)
         sys.exit(1)
 
-    # Подключение SSH/SFTP
+    # Маршрутизация
+    routes = build_routes(default_cfg.get("file_map", []))
+
+    # Подключение
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -336,22 +414,62 @@ def main():
 
         sftp = client.open_sftp()
 
-        # Нормализуем целевую директорию (и создадим её)
-        remote_root = sftp.normalize(args.remote_dir)
-        ensure_remote_dirs(sftp, remote_root, verbose=args.verbose)
+        # Нормализуем базовую директорию (создадим её)
+        base_remote_root = sftp.normalize(args.remote_dir)
+        ensure_remote_dirs(sftp, base_remote_root, verbose=args.verbose)
 
-        # Отправка по типу архива
         lower = archive.name.lower()
         if lower.endswith(".zip"):
-            upload_zip(sftp, archive, remote_root, args.strip_top_level, verbose=args.verbose)
+            upload_zip(sftp, archive, base_remote_root, routes, args.strip_top_level, verbose=args.verbose)
         elif lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
-            upload_tar(sftp, archive, remote_root, args.strip_top_level, verbose=args.verbose)
+            upload_tar(sftp, archive, base_remote_root, routes, args.strip_top_level, verbose=args.verbose)
         else:
             print(f"[ОШИБКА] Неподдерживаемый тип архива: {archive.name}", file=sys.stderr)
             sys.exit(2)
 
-        print(f"[ГОТОВО] Архив {archive.name} разложен в {remote_root}")
+        # --- DB restore, если включено ---
+        db_cfg = default_cfg.get("db_restore", {}) or {}
+        if db_cfg.get("enabled"):
+            # найдём SQL в архиве по glob
+            sql_glob = db_cfg.get("sql_glob", "*.sql")
+            sql_member_name = None
 
+            if lower.endswith(".zip"):
+                with zipfile.ZipFile(archive, "r") as zf:
+                    names = [n for n in (i.filename for i in zf.infolist())
+                             if fnmatch.fnmatch(normalize_arcpath(n), sql_glob)]
+                    if names:
+                        names.sort()  # последний по имени
+                        sql_member_name = names[-1]
+                        if args.strip_top_level:
+                            top = first_top_level(names)
+                            # не обязательно срезать для SQL, он и так относительный
+                    if not sql_member_name:
+                        raise FileNotFoundError(f"В архиве нет SQL по шаблону {sql_glob}")
+                    if args.verbose:
+                        print(f"[INFO] Восстанавливаю БД из: {sql_member_name}")
+                    with zf.open(sql_member_name, "r") as sql_stream:
+                        run_sql_via_psql(client, sql_stream, db_cfg, verbose=args.verbose)
+
+            else:  # tar
+                with tarfile.open(archive, "r:*") as tf:
+                    names = [m.name for m in tf.getmembers()
+                             if fnmatch.fnmatch(normalize_arcpath(m.name), sql_glob)]
+                    if names:
+                        names.sort()
+                        sql_member_name = names[-1]
+                    if not sql_member_name:
+                        raise FileNotFoundError(f"В архиве нет SQL по шаблону {sql_glob}")
+                    if args.verbose:
+                        print(f"[INFO] Восстанавливаю БД из: {sql_member_name}")
+                    m = tf.getmember(sql_member_name)
+                    fsrc = tf.extractfile(m)
+                    if fsrc is None:
+                        raise RuntimeError(f"Не удалось открыть {sql_member_name} в tar")
+                    with fsrc:
+                        run_sql_via_psql(client, fsrc, db_cfg, verbose=args.verbose)
+
+        print("[ГОТОВО] Файлы разложены. Восстановление БД (если включено) — выполнено.")
         sftp.close()
     finally:
         try:

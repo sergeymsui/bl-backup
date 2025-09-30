@@ -3,7 +3,7 @@ port: 22
 user: user
 password: "12345678"
 remote_dir: /mnt/pod/uploads
-out: C:\Users\Malichenko\bl-backup
+# out: C:\Users\Malichenko\bl-backup
 exclude:
   - .log
   - .tmp
@@ -13,12 +13,10 @@ pg_dump:
   enabled: true
   db_host: 10.168.215.28
   db_port: 5432
-  db_name: mydb
+  db_name: postgres
   db_user: postgres
-  db_password: your_password   # опционально; если не указать — .pgpass на VM или PGPASSFILE
-  # опционально: /usr/bin/pg_dump, если в PATH другой
+  db_password: postgres
   pg_dump_path: pg_dump
-  # дополнительные опции pg_dump (список, как есть)
   extra_args:
     - --no-owner
     - --no-privileges

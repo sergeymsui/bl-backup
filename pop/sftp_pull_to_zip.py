@@ -110,7 +110,7 @@ def compute_output_zip_path(out_dir_arg: Optional[str]) -> Path:
     else:
         p = Path.cwd() / "archives"
     p.mkdir(parents=True, exist_ok=True)
-    fname = f"{date.today():%Y-%m-%d}.zip"
+    fname = f"bl-backup-{date.today():%Y-%m-%d}.zip"
     return p / fname
 
 
@@ -328,7 +328,7 @@ def main():
     if sys.platform.startswith("win") and not args.out:
         docs = get_windows_documents_dir()
         base_name = date.today().strftime("%Y-%m-%d")
-        dest = make_unique_archive_path(docs, base_name)
+        dest = make_unique_archive_path(docs, f"bl-backup-{base_name}")
         args.out = str(dest)
         print(f"[INFO] --archive не задан, сохраню архив в: {args.out}")
 

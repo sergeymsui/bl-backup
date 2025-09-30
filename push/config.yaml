@@ -1,0 +1,8 @@
+host: 10.168.215.28
+port: 22
+user: user
+password: 12345678
+remote_dir: /mnt/pod/uploads
+archive: C:\Users\Malichenko\bl-backup\reports_latest.zip
+strip_top_level: true
+verbose: true

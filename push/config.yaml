@@ -1,17 +1,17 @@
-host: 10.168.215.28
+host: 192.168.89.126
 port: 22
-user: user
-password: "12345678"
+user: root
+password: "1qaz@WSX"
 remote_dir: /mnt/pod/uploads
-archive: C:\Users\Malichenko\bl-backup\2025-09-30.zip
+# archive: C:\Users\Malichenko\bl-backup\2025-09-30.zip
 strip_top_level: true
 verbose: true
 
 db_restore:
   enabled: true
-  sql_glob: "*.sql"          
-  psql_path: psql            
-  db_host: 10.168.215.28
+  sql_glob: "*.sql"
+  psql_path: psql
+  db_host: 192.168.89.130
   db_port: 5432
   db_name: postgres
   db_user: postgres

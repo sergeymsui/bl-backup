@@ -1,7 +1,7 @@
-host: 10.168.215.28
+host: 192.168.89.126
 port: 22
-user: user
-password: "12345678"
+user: msvb
+password: "1qaz@WSX"
 remote_dir: /mnt/pod/uploads
 # out: C:\Users\Malichenko\bl-backup
 exclude:
@@ -11,7 +11,7 @@ verbose: true
 
 pg_dump:
   enabled: true
-  db_host: 10.168.215.28
+  db_host: 192.168.89.130
   db_port: 5432
   db_name: postgres
   db_user: postgres

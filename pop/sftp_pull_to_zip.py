@@ -168,7 +168,8 @@ def run_pg_dump_into_zip(
 
     cmd = env_prefix + " ".join(shquote(a) for a in args)
 
-    # Запуск в bash -lc для подхвата PATH и .pgpass
+    # Запуск в bash для подхвата PATH и .pgpass
+    print(cmd)
     full_cmd = shquote(cmd)
     if verbose:
         print(f"[INFO] pg_dump cmd on VM: {full_cmd}")

@@ -307,7 +307,7 @@ def run_sql_via_psql(
         raise ValueError("Для восстановления БД нужны db_name и db_user")
     
     env_prefix = f"PGPASSWORD={shquote(db_password)} " if db_password else ""
-    full_cmd = shquote(env_prefix + f"dropdb -h {shquote(db_host)} -p {db_port} -U {shquote(db_user)} {shquote(db_name)}")
+    full_cmd = shquote(env_prefix + f"dropdb --force -h {shquote(db_host)} -p {db_port} -U {shquote(db_user)} {shquote(db_name)}")
     _, stdout_c, stderr_c = ssh.exec_command(full_cmd)
     code = stdout_c.channel.recv_exit_status()
     if code != 0:
